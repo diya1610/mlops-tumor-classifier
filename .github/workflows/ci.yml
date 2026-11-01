@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main] # main runs this through cd.yml
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest -q
+      - name: Dashboard JSON matches its generator
+        run: |
+          python scripts/build_dashboard.py
+          git diff --exit-code k8s/monitoring/ml-api-dashboard.json
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build image (trains the model and enforces the quality gate)
+        run: docker build --build-arg GIT_SHA="${GITHUB_SHA::7}" -t mlops-app:ci .
+      - name: Smoke test the API
+        run: |
+          docker run -d --name api -p 8000:8000 mlops-app:ci
+          for _ in $(seq 1 30); do
+            curl -fs localhost:8000/health && break
+            sleep 2
+          done
+          curl -fs localhost:8000/health
+          curl -fs localhost:8000/metrics | grep -q mlapi_model_info
+      - name: Show API logs on failure
+        if: failure()
+        run: docker logs api
+
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate Kubernetes manifests
+        run: |
+          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz \
+            | tar xz kubeconform
+          kubectl kustomize k8s | ./kubeconform -strict -summary -
+
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+      - run: terraform fmt -check -recursive
+      - run: terraform init -backend=false
+      - run: terraform validate

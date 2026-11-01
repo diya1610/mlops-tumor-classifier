@@ -1,0 +1,78 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    # Skipped until the Terraform outputs are set as repository variables (see README).
+    if: vars.AZURE_CLIENT_ID != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      IMAGE: ${{ vars.ACR_NAME }}.azurecr.io/mlops-app
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and push image
+        run: |
+          TAG="${GITHUB_SHA::7}"
+          az acr login --name "${{ vars.ACR_NAME }}"
+          docker build --build-arg GIT_SHA="$TAG" -t "$IMAGE:$TAG" .
+          docker push "$IMAGE:$TAG"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Connect to AKS
+        run: |
+          az aks get-credentials \
+            --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" \
+            --name "${{ vars.AKS_NAME }}"
+
+      - name: Create Grafana admin secret
+        env:
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+        run: |
+          test -n "$GRAFANA_ADMIN_PASSWORD" || { echo "Set the GRAFANA_ADMIN_PASSWORD secret"; exit 1; }
+          kubectl create namespace mlops --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n mlops create secret generic grafana-admin \
+            --from-literal=admin-password="$GRAFANA_ADMIN_PASSWORD" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy
+        working-directory: k8s
+        run: |
+          kustomize edit set image "mlops-app=$IMAGE:$TAG"
+          kubectl apply -k .
+
+      - name: Wait for rollout
+        run: |
+          for deployment in api ui prometheus grafana; do
+            kubectl -n mlops rollout status "deployment/$deployment" --timeout=300s
+          done
+
+      - name: Roll back on failure
+        if: failure()
+        run: |
+          kubectl -n mlops rollout undo deployment/api
+          kubectl -n mlops rollout undo deployment/ui

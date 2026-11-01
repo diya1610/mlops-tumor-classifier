@@ -1,0 +1,40 @@
+groups:
+  - name: ml-api
+    rules:
+      - alert: ApiDown
+        expr: sum(up{job="api"}) == 0 or absent(up{job="api"})
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: No API instance is being scraped successfully.
+
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(mlapi_requests_total{status=~"5.."}[5m]))
+            / sum(rate(mlapi_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: More than 5% of API requests are failing.
+
+      - alert: HighPredictLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(mlapi_request_duration_seconds_bucket{path="/predict"}[5m]))) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: p95 /predict latency is above 500 ms.
+
+      - alert: InputDrift
+        expr: |
+          sum(rate(mlapi_out_of_range_predictions_total[15m]))
+            / sum(rate(mlapi_predictions_total[15m])) > 0.2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: More than 20% of inputs fall outside the training range. Consider retraining.
